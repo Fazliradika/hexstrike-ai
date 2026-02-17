@@ -467,6 +467,11 @@ def setup_mcp_server(hexstrike_client: HexStrikeClient) -> FastMCP:
         """Cancel a run."""
         return hexstrike_client.safe_post(f"api/runs/{run_id}/cancel", {})
 
+    @mcp.tool()
+    def get_run_findings(run_id: str, offset: int = 0, limit: int = 200) -> Dict[str, Any]:
+        """Fetch structured findings for a run (paged)."""
+        return hexstrike_client.safe_get(f"api/runs/{run_id}/findings", {"offset": offset, "limit": limit})
+
     # ============================================================================
     # CLOUD SECURITY TOOLS
     # ============================================================================

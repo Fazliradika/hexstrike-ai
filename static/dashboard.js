@@ -109,25 +109,131 @@
   }
 
   function renderFindings(findings, total) {
-    const rows = [];
-    rows.push(`<div class="tr th"><div>finding</div><div>severity</div><div>tool</div></div>`);
+    // Legacy no-op: replaced by card renderer
+  }
+
+  function normalizeSev(sev) {
+    const s = String(sev || 'unknown').toLowerCase();
+    if (['critical','high','medium','low','info','unknown'].includes(s)) return s;
+    return 'unknown';
+  }
+
+  function renderFindingsChips(summary, total) {
+    const s = summary || {};
+    const critical = Number(s.critical || 0);
+    const high = Number(s.high || 0);
+    const medium = Number(s.medium || 0);
+    const low = Number(s.low || 0);
+    const info = Number(s.info || 0);
+    const unknown = Number(s.unknown || 0);
+    const chips = [
+      `<span class="chip critical"><b>Critical</b> ${critical}</span>`,
+      `<span class="chip high"><b>High</b> ${high}</span>`,
+      `<span class="chip medium"><b>Medium</b> ${medium}</span>`,
+      `<span class="chip low"><b>Low</b> ${low}</span>`,
+      `<span class="chip info"><b>Info</b> ${info}</span>`,
+      `<span class="chip unknown"><b>Other</b> ${unknown}</span>`,
+      `<span class="chip"><b>Total</b> ${Number(total || 0)}</span>`,
+    ];
+    const chipsEl = el('findings-chips');
+    if (chipsEl) chipsEl.innerHTML = chips.join('');
+  }
+
+  function currentSevFilter() {
+    const get = (id) => (el(id) ? el(id).checked : true);
+    return {
+      critical: get('sev-critical'),
+      high: get('sev-high'),
+      medium: get('sev-medium'),
+      low: get('sev-low'),
+      info: get('sev-info'),
+      unknown: get('sev-unknown'),
+    };
+  }
+
+  function matchesSearch(f, q) {
+    if (!q) return true;
+    const hay = [f.title, f.location, f.tool, f.type].filter(Boolean).join(' ').toLowerCase();
+    return hay.includes(q);
+  }
+
+  function renderFindingCards(findings, summary, total) {
+    const cardsEl = el('findings-cards');
+    if (!cardsEl) return;
+
+    const q = (el('findings-search')?.value || '').trim().toLowerCase();
+    const sevFilter = currentSevFilter();
 
     const items = (findings || []).slice().reverse();
-    for (const f of items.slice(0, 200)) {
-      const title = (f.title || 'Finding').toString();
-      const loc = (f.location || '').toString();
-      const tool = (f.tool || '').toString();
-      const sev = (f.severity || 'info').toString();
-      rows.push(
-        `<div class="tr" style="cursor:default">
-          <div>${escapeHtml(title)}<div class="muted" style="margin-top:3px">${escapeHtml(loc).slice(0, 110)}</div></div>
-          <div>${badgeForSeverity(sev)}</div>
-          <div class="muted">${escapeHtml(tool)}</div>
-        </div>`
-      );
+    const filtered = [];
+    for (const f of items) {
+      const sev = normalizeSev(f.severity);
+      if (!sevFilter[sev]) continue;
+      if (!matchesSearch(f, q)) continue;
+      filtered.push(f);
+      if (filtered.length >= 400) break;
     }
 
-    el('findings').innerHTML = rows.join('');
+    renderFindingsChips(summary, total);
+
+    const html = filtered.map((f) => {
+      const sev = normalizeSev(f.severity);
+      const title = escapeHtml(f.title || 'Finding');
+      const tool = escapeHtml(f.tool || '');
+      const loc = escapeHtml(f.location || '');
+      const ts = escapeHtml(f.ts || '');
+      const type = escapeHtml(f.type || 'finding');
+      const evidence = escapeHtml(f.evidence || '');
+      const id = escapeHtml(f.id || '');
+
+      const copyBtn = loc
+        ? `<button class="btn-mini" data-copy="${loc}">Copy endpoint</button>`
+        : '';
+
+      return `
+        <div class="fcard" data-id="${id}">
+          <div class="top">
+            <div>
+              <div class="title">${title}</div>
+              <div class="loc">${loc}</div>
+            </div>
+            <div class="actions">
+              <span class="sev ${sev}">${sev.toUpperCase()}</span>
+              ${copyBtn}
+            </div>
+          </div>
+          <div class="meta">
+            <span class="badge">${type}</span>
+            <span class="badge">${tool}</span>
+            <span class="muted">${ts}</span>
+          </div>
+          ${evidence ? `
+            <details>
+              <summary>Evidence</summary>
+              <pre>${evidence}</pre>
+            </details>
+          ` : ''}
+        </div>
+      `;
+    }).join('');
+
+    cardsEl.innerHTML = html || `<div class="detail">No findings match current filters.</div>`;
+
+    // Wire copy buttons
+    for (const btn of cardsEl.querySelectorAll('button[data-copy]')) {
+      btn.addEventListener('click', async (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        const text = btn.getAttribute('data-copy') || '';
+        try {
+          await navigator.clipboard.writeText(text);
+          btn.textContent = 'Copied';
+          setTimeout(() => (btn.textContent = 'Copy endpoint'), 900);
+        } catch {
+          // ignore
+        }
+      });
+    }
   }
 
   function escapeHtml(s) {
@@ -145,6 +251,10 @@
       renderStages([]);
       renderLogs([]);
       renderFindings([], 0);
+      const chipsEl = el('findings-chips');
+      const cardsEl = el('findings-cards');
+      if (chipsEl) chipsEl.innerHTML = '';
+      if (cardsEl) cardsEl.innerHTML = '';
       return;
     }
 
@@ -164,7 +274,7 @@
 
     renderStages(run.stages);
     renderLogs(run.logs);
-    renderFindings(run.findings, run.findings_total);
+    renderFindingCards(run.findings, run.findings_summary, run.findings_total);
   }
 
   function stopSSE() {
@@ -228,6 +338,19 @@
       renderRunDetail(run);
     } catch {
       // ignore
+    }
+  }
+
+  function wireFindingsControls() {
+    const ids = [
+      'findings-search',
+      'sev-critical','sev-high','sev-medium','sev-low','sev-info','sev-unknown',
+    ];
+    for (const id of ids) {
+      const node = el(id);
+      if (!node) continue;
+      const eventName = id === 'findings-search' ? 'input' : 'change';
+      node.addEventListener(eventName, () => refreshSelectedRun());
     }
   }
 
@@ -325,6 +448,8 @@
       el('btn-save-key').addEventListener('click', () => setApiKey(keyInput.value.trim()));
       el('btn-clear-key').addEventListener('click', () => { setApiKey(''); keyInput.value = ''; });
     }
+
+    wireFindingsControls();
   }
 
   async function init() {

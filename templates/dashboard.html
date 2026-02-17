@@ -97,7 +97,21 @@
           <pre id="logs" class="logs"></pre>
 
           <h3>Findings</h3>
-          <div id="findings" class="table"></div>
+          <div class="findings-toolbar">
+            <div id="findings-chips" class="chips"></div>
+            <div class="findings-controls">
+              <input class="input" id="findings-search" placeholder="Search title / endpoint / tool…" />
+              <div class="checks">
+                <label><input type="checkbox" id="sev-critical" checked /> Critical</label>
+                <label><input type="checkbox" id="sev-high" checked /> High</label>
+                <label><input type="checkbox" id="sev-medium" checked /> Medium</label>
+                <label><input type="checkbox" id="sev-low" checked /> Low</label>
+                <label><input type="checkbox" id="sev-info" checked /> Info</label>
+                <label><input type="checkbox" id="sev-unknown" checked /> Other</label>
+              </div>
+            </div>
+          </div>
+          <div id="findings-cards" class="cards"></div>
         </div>
       </div>
     </section>

@@ -9534,6 +9534,14 @@ class RunManager:
             "results": {},
             "logs": [],
             "findings": [],
+            "findings_summary": {
+                "critical": 0,
+                "high": 0,
+                "medium": 0,
+                "low": 0,
+                "info": 0,
+                "unknown": 0,
+            },
             "_events": [],  # internal: list of {id, event}
             "_next_event_id": 1,
             "_cancelled": False,
@@ -9660,6 +9668,17 @@ class RunManager:
             if not run:
                 return
             run["findings"].extend(findings)
+
+            summary = run.get("findings_summary")
+            if not isinstance(summary, dict):
+                summary = {"critical": 0, "high": 0, "medium": 0, "low": 0, "info": 0, "unknown": 0}
+                run["findings_summary"] = summary
+
+            for f in findings:
+                sev = str(f.get("severity") or "unknown").lower()
+                if sev not in summary:
+                    sev = "unknown"
+                summary[sev] = int(summary.get(sev, 0)) + 1
             # cap to prevent unbounded growth
             if len(run["findings"]) > 20000:
                 run["findings"] = run["findings"][-20000:]
@@ -9718,6 +9737,7 @@ class RunManager:
             "logs": run.get("logs", [])[-300:],
             "findings": run.get("findings", [])[-200:],
             "findings_total": len(run.get("findings", [])),
+            "findings_summary": run.get("findings_summary", {}),
             "last_event_id": (run.get("_next_event_id", 1) - 1),
         }
 
