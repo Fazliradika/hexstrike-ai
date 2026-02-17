@@ -186,6 +186,15 @@
       const evidence = escapeHtml(f.evidence || '');
       const id = escapeHtml(f.id || '');
 
+      const meta = f.meta && typeof f.meta === 'object' ? f.meta : null;
+      const metaBadges = [];
+      if (meta?.template_id) metaBadges.push(`<span class="badge">${escapeHtml(meta.template_id)}</span>`);
+      if (meta?.cve) metaBadges.push(`<span class="badge">${escapeHtml(meta.cve)}</span>`);
+      if (meta?.cwe) metaBadges.push(`<span class="badge">${escapeHtml(meta.cwe)}</span>`);
+      if (meta?.cvss_score !== undefined && meta?.cvss_score !== null && String(meta.cvss_score) !== '') {
+        metaBadges.push(`<span class="badge">CVSS ${escapeHtml(meta.cvss_score)}</span>`);
+      }
+
       const copyBtn = loc
         ? `<button class="btn-mini" data-copy="${loc}">Copy endpoint</button>`
         : '';
@@ -205,6 +214,7 @@
           <div class="meta">
             <span class="badge">${type}</span>
             <span class="badge">${tool}</span>
+            ${metaBadges.join('')}
             <span class="muted">${ts}</span>
           </div>
           ${evidence ? `

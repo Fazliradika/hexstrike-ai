@@ -9755,11 +9755,20 @@ class ToolOutputNormalizer:
         return datetime.now().isoformat()
 
     @staticmethod
-    def _mk_finding(tool: str, severity: str, title: str, target: str = "", location: str = "", evidence: str = "", finding_type: str = "finding") -> Dict[str, Any]:
+    def _mk_finding(
+        tool: str,
+        severity: str,
+        title: str,
+        target: str = "",
+        location: str = "",
+        evidence: str = "",
+        finding_type: str = "finding",
+        meta: Dict[str, Any] | None = None,
+    ) -> Dict[str, Any]:
         sev = (severity or "info").strip().lower()
         if sev not in ToolOutputNormalizer.SEVERITY_ORDER:
             sev = "info"
-        return {
+        finding = {
             "id": uuid.uuid4().hex,
             "ts": ToolOutputNormalizer._now(),
             "tool": tool,
@@ -9770,6 +9779,12 @@ class ToolOutputNormalizer:
             "location": location[:500],
             "evidence": evidence[:2000],
         }
+
+        if meta and isinstance(meta, dict):
+            # Keep meta small and JSON-serializable
+            finding["meta"] = meta
+
+        return finding
 
     @staticmethod
     def normalize(tool: str, stdout: str, stderr: str = "", target: str = "") -> List[Dict[str, Any]]:
@@ -9827,13 +9842,84 @@ class ToolOutputNormalizer:
                     info = obj.get("info", {}) or {}
                     severity = (info.get("severity") or "info").lower()
                     name = info.get("name") or obj.get("template") or obj.get("template-id") or "Nuclei finding"
+
                     matched = obj.get("matched-at") or obj.get("host") or obj.get("url") or ""
                     template_id = obj.get("template-id") or obj.get("template") or ""
-                    evidence = obj.get("matcher-name") or obj.get("extracted-results") or ""
-                    title = f"{name}"
-                    if template_id:
-                        title = f"{name} ({template_id})"
-                    findings.append(ToolOutputNormalizer._mk_finding("nuclei", severity, title, target=target, location=matched, evidence=str(evidence)))
+                    matcher = obj.get("matcher-name") or obj.get("matcher") or ""
+                    extracted = obj.get("extracted-results") or obj.get("extracted") or []
+
+                    # Classification (CVE/CWE/CVSS)
+                    classification = info.get("classification") or {}
+                    cve = classification.get("cve-id") or classification.get("cve") or ""
+                    cwe = classification.get("cwe-id") or ""
+                    cvss_score = classification.get("cvss-score")
+                    cvss_metrics = classification.get("cvss-metrics") or ""
+
+                    # References/tags
+                    tags = info.get("tags")
+                    if isinstance(tags, str):
+                        tags = [t.strip() for t in tags.split(",") if t.strip()]
+                    if not isinstance(tags, list):
+                        tags = []
+                    references = info.get("reference") or info.get("references") or []
+                    if isinstance(references, str):
+                        references = [references]
+                    if not isinstance(references, list):
+                        references = []
+
+                    # Request/response (if present)
+                    req = obj.get("request")
+                    resp = obj.get("response")
+                    req_s = ""
+                    resp_s = ""
+                    if isinstance(req, str):
+                        req_s = req
+                    elif isinstance(req, dict):
+                        req_s = json.dumps(req, ensure_ascii=False)
+                    if isinstance(resp, str):
+                        resp_s = resp
+                    elif isinstance(resp, dict):
+                        resp_s = json.dumps(resp, ensure_ascii=False)
+
+                    # Evidence string (compact)
+                    ev_parts = []
+                    if matcher:
+                        ev_parts.append(f"matcher={matcher}")
+                    if extracted:
+                        if isinstance(extracted, list):
+                            ev_parts.append("extracted=" + ", ".join([str(x) for x in extracted[:5]]))
+                        else:
+                            ev_parts.append("extracted=" + str(extracted))
+                    if info.get("description"):
+                        ev_parts.append(str(info.get("description"))[:400])
+                    if req_s:
+                        ev_parts.append("request:\n" + req_s[:600])
+                    if resp_s:
+                        ev_parts.append("response:\n" + resp_s[:600])
+                    evidence = "\n".join(ev_parts).strip()
+
+                    title = f"{name}" + (f" ({template_id})" if template_id else "")
+                    meta = {
+                        "template_id": template_id,
+                        "matcher": matcher,
+                        "tags": tags[:10],
+                        "cve": cve,
+                        "cwe": cwe,
+                        "cvss_score": cvss_score,
+                        "cvss_metrics": cvss_metrics,
+                        "references": references[:5],
+                        "nuclei_type": obj.get("type") or "",
+                    }
+                    findings.append(ToolOutputNormalizer._mk_finding(
+                        "nuclei",
+                        severity,
+                        title,
+                        target=target,
+                        location=str(matched),
+                        evidence=evidence,
+                        finding_type="vulnerability",
+                        meta=meta,
+                    ))
                     continue
                 except Exception:
                     pass
