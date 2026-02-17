@@ -2,14 +2,14 @@
 
 <img src="assets/hexstrike-logo.png" alt="HexStrike AI Logo" width="220" style="margin-bottom: 20px;"/>
 
-# HexStrike AI MCP Agents v6.0
+# HexStrike AI MCP Agents v7.0
 ### AI-Powered MCP Cybersecurity Automation Platform
 
 [![Python](https://img.shields.io/badge/Python-3.8%2B-blue.svg)](https://www.python.org/)
 [![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 [![Security](https://img.shields.io/badge/Security-Penetration%20Testing-red.svg)](https://github.com/0x4m4/hexstrike-ai)
 [![MCP](https://img.shields.io/badge/MCP-Compatible-purple.svg)](https://github.com/0x4m4/hexstrike-ai)
-[![Version](https://img.shields.io/badge/Version-6.0.0-orange.svg)](https://github.com/0x4m4/hexstrike-ai/releases)
+[![Version](https://img.shields.io/badge/Version-7.0.0-orange.svg)](https://github.com/0x4m4/hexstrike-ai/releases)
 [![Tools](https://img.shields.io/badge/Security%20Tools-150%2B-brightgreen.svg)](https://github.com/0x4m4/hexstrike-ai)
 [![Agents](https://img.shields.io/badge/AI%20Agents-12%2B-purple.svg)](https://github.com/0x4m4/hexstrike-ai)
 [![Stars](https://img.shields.io/github/stars/0x4m4/hexstrike-ai?style=social)](https://github.com/0x4m4/hexstrike-ai)
@@ -44,7 +44,7 @@
 
 ## Architecture Overview
 
-HexStrike AI MCP v6.0 features a multi-agent architecture with autonomous AI agents, intelligent decision-making, and vulnerability intelligence.
+HexStrike AI MCP v7.0 features a multi-agent architecture with autonomous AI agents, intelligent decision-making, vulnerability intelligence, and a built-in web dashboard for live run tracking.
 
 ```mermaid
 %%{init: {"themeVariables": {
@@ -197,6 +197,24 @@ python3 hexstrike_server.py --debug
 # Optional: Custom port configuration
 python3 hexstrike_server.py --port 8888
 ```
+
+### v7.0 Dashboard
+
+- Open `http://127.0.0.1:8888/dashboard` to monitor: health, tool status, active processes, and tracked runs.
+- Start runs from the UI (smart scan / bugbounty workflows) and follow progress via live events.
+
+### v7.0 Runs (Tracked Assessments)
+
+- `smart_scan`: picks a small set of tools automatically and runs them.
+- `web_assessment`: multi-stage pipeline (analyze → tech detect → httpx → katana → nuclei) and finishes as `completed_with_errors` if some tools are missing.
+- Each run stores structured `findings` (best-effort) so you don’t need to read raw stdout.
+
+### v7.0 Security Flags (Important)
+
+- `HEXSTRIKE_API_KEY`: when set, all `/api/*` endpoints require auth.
+  - Send `Authorization: Bearer <HEXSTRIKE_API_KEY>` (dashboard supports token for SSE).
+- `HEXSTRIKE_ENABLE_COMMAND_EXECUTOR=false` by default (blocks `/api/command`).
+- `HEXSTRIKE_ENABLE_EXPLOIT_FEATURES=false` by default (blocks exploit generation endpoints).
 
 ### Verify Installation
 

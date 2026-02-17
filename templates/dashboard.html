@@ -1,0 +1,133 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>HexStrike AI Dashboard</title>
+  <link rel="stylesheet" href="/static/dashboard.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <div class="title">HexStrike AI</div>
+      <div class="subtitle">Dashboard • v{{ version }}</div>
+    </div>
+
+    <div class="topbar-right">
+      <div class="pill" id="health-pill">Health: …</div>
+      <div class="pill" id="tools-pill">Tools: …</div>
+      <button class="btn" id="btn-refresh">Refresh</button>
+    </div>
+  </header>
+
+  <main class="grid">
+    <section class="card">
+      <h2>Connection</h2>
+      <div class="kv">
+        <div class="k">API</div>
+        <div class="v">http://{{ api_host }}:{{ api_port }}</div>
+      </div>
+
+      {% if api_key_required %}
+      <div class="notice warn">
+        API key auth is enabled. Enter the key below (stored in localStorage).
+      </div>
+      <div class="row">
+        <input class="input" id="api-key" type="password" placeholder="HEXSTRIKE_API_KEY" />
+        <button class="btn" id="btn-save-key">Save</button>
+        <button class="btn secondary" id="btn-clear-key">Clear</button>
+      </div>
+      {% else %}
+      <div class="notice ok">API key auth is not enabled.</div>
+      {% endif %}
+    </section>
+
+    <section class="card">
+      <h2>Start Run</h2>
+      <div class="row">
+        <select class="input" id="run-type">
+          <option value="smart_scan">smart_scan</option>
+          <option value="web_assessment">web_assessment</option>
+          <option value="bugbounty_assessment">bugbounty_assessment</option>
+          <option value="recon_workflow">recon_workflow</option>
+          <option value="osint_workflow">osint_workflow</option>
+          <option value="business_logic_workflow">business_logic_workflow</option>
+          <option value="file_upload_workflow">file_upload_workflow</option>
+        </select>
+        <button class="btn" id="btn-start">Start</button>
+      </div>
+
+      <div class="form">
+        <label class="label">target (smart_scan)</label>
+        <input class="input" id="input-target" placeholder="https://example.com or 1.2.3.4" />
+
+        <label class="label">domain (bugbounty/workflows)</label>
+        <input class="input" id="input-domain" placeholder="example.com" />
+
+        <label class="label">target_url (file upload workflow)</label>
+        <input class="input" id="input-target-url" placeholder="https://example.com/upload" />
+      </div>
+
+      <div class="notice">Tip: pilih run_type, isi field yang sesuai, lalu Start.</div>
+    </section>
+
+    <section class="card span2">
+      <h2>Runs</h2>
+      <div class="runs">
+        <div class="runs-list">
+          <div class="toolbar">
+            <div class="muted">Recent runs</div>
+            <button class="btn secondary" id="btn-reload-runs">Reload</button>
+          </div>
+          <div id="runs-table" class="table"></div>
+        </div>
+
+        <div class="runs-detail">
+          <div class="toolbar">
+            <div class="muted">Selected run</div>
+            <button class="btn danger" id="btn-cancel">Cancel</button>
+          </div>
+
+          <div id="run-detail" class="detail">Select a run…</div>
+
+          <h3>Stages</h3>
+          <div id="stages" class="table"></div>
+
+          <h3>Logs</h3>
+          <pre id="logs" class="logs"></pre>
+
+          <h3>Findings</h3>
+          <div id="findings" class="table"></div>
+        </div>
+      </div>
+    </section>
+
+    <section class="card span2">
+      <h2>Processes</h2>
+      <div class="toolbar">
+        <div class="muted">Active processes dashboard</div>
+        <button class="btn secondary" id="btn-reload-proc">Reload</button>
+      </div>
+      <pre id="proc" class="logs"></pre>
+    </section>
+
+    <section class="card span2">
+      <h2>Tool Status</h2>
+      <div class="toolbar">
+        <div class="muted">Installed tools + versions (best effort)</div>
+        <button class="btn secondary" id="btn-reload-tools">Reload</button>
+      </div>
+      <div id="tools" class="table"></div>
+
+      <h3>Install/Upgrade Plan</h3>
+      <div class="toolbar">
+        <div class="muted">Commands only (not executed automatically)</div>
+        <button class="btn secondary" id="btn-install-plan">Load Plan</button>
+      </div>
+      <pre id="install-plan" class="logs"></pre>
+    </section>
+  </main>
+
+  <script src="/static/dashboard.js"></script>
+</body>
+</html>

@@ -1,0 +1,17 @@
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Logs
+hexstrike.log
+*.log
+
+# Virtual envs
+.venv/
+venv/
+hexstrike-env/
+hexstrike_env/
+
+# OS/editor
+.DS_Store
+.vscode/

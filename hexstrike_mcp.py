@@ -414,6 +414,59 @@ def setup_mcp_server(hexstrike_client: HexStrikeClient) -> FastMCP:
 
         return result
 
+    # =========================================================================
+    # RUN MANAGEMENT (v7.0)
+    # =========================================================================
+
+    @mcp.tool()
+    def start_run(run_type: str = "smart_scan",
+                  target: str = "",
+                  domain: str = "",
+                  target_url: str = "",
+                  objective: str = "comprehensive",
+                  max_tools: int = 5,
+                  include_osint: bool = True,
+                  include_business_logic: bool = True,
+                  depth: int = 2,
+                  severity: str = "critical,high,medium",
+                  nuclei_args: str = "-jsonl") -> Dict[str, Any]:
+        """Start a tracked run (returns run_id)."""
+
+        payload: Dict[str, Any] = {
+            "run_type": run_type,
+            "objective": objective,
+            "max_tools": max_tools,
+            "include_osint": include_osint,
+            "include_business_logic": include_business_logic,
+            "depth": depth,
+            "severity": severity,
+            "nuclei_args": nuclei_args,
+        }
+        if target:
+            payload["target"] = target
+        if domain:
+            payload["domain"] = domain
+        if target_url:
+            payload["target_url"] = target_url
+
+        logger.info(f"🚀 Starting run: {run_type}")
+        return hexstrike_client.safe_post("api/runs/start", payload)
+
+    @mcp.tool()
+    def list_runs(limit: int = 50) -> Dict[str, Any]:
+        """List recent runs."""
+        return hexstrike_client.safe_get("api/runs", {"limit": limit})
+
+    @mcp.tool()
+    def get_run(run_id: str) -> Dict[str, Any]:
+        """Get a run by id."""
+        return hexstrike_client.safe_get(f"api/runs/{run_id}")
+
+    @mcp.tool()
+    def cancel_run(run_id: str) -> Dict[str, Any]:
+        """Cancel a run."""
+        return hexstrike_client.safe_post(f"api/runs/{run_id}/cancel", {})
+
     # ============================================================================
     # CLOUD SECURITY TOOLS
     # ============================================================================

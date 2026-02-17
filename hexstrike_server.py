@@ -39,13 +39,14 @@ import shutil
 import venv
 import zipfile
 from pathlib import Path
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, Response, stream_with_context, render_template, redirect, url_for
 import psutil
 import signal
 import requests
 import re
 import socket
 import urllib.parse
+import shlex
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import List, Set, Tuple
@@ -64,6 +65,8 @@ import mitmproxy
 from mitmproxy import http as mitmhttp
 from mitmproxy.tools.dump import DumpMaster
 from mitmproxy.options import Options as MitmOptions
+import uuid
+from collections import deque
 
 # ============================================================================
 # LOGGING CONFIGURATION (MUST BE FIRST)
@@ -93,6 +96,82 @@ logger = logging.getLogger(__name__)
 # Flask app configuration
 app = Flask(__name__)
 app.config['JSON_SORT_KEYS'] = False
+
+# ==========================================================================
+# HEXSTRIKE v7.0 SECURITY & FEATURE FLAGS
+# ==========================================================================
+
+HEXSTRIKE_VERSION = "7.0.0"
+
+def _env_flag(name: str, default: bool = False) -> bool:
+    val = os.environ.get(name)
+    if val is None:
+        return default
+    return str(val).strip().lower() in ("1", "true", "yes", "y", "on")
+
+
+# Optional API authentication: if set, all /api/* routes require auth
+HEXSTRIKE_API_KEY = os.environ.get("HEXSTRIKE_API_KEY", "").strip()
+
+# Dangerous capabilities are disabled by default in v7.0
+HEXSTRIKE_ENABLE_COMMAND_EXECUTOR = _env_flag("HEXSTRIKE_ENABLE_COMMAND_EXECUTOR", False)
+HEXSTRIKE_ENABLE_EXPLOIT_FEATURES = _env_flag("HEXSTRIKE_ENABLE_EXPLOIT_FEATURES", False)
+
+# Run worker HTTP timeout for calling internal endpoints
+HEXSTRIKE_RUN_HTTP_TIMEOUT = int(os.environ.get("HEXSTRIKE_RUN_HTTP_TIMEOUT", "300"))
+
+
+def _is_auth_exempt_path(path: str) -> bool:
+    # Public endpoints
+    if path in ("/health", "/", "/dashboard"):
+        return True
+    if path.startswith("/dashboard/"):
+        return True
+    if path.startswith("/assets/"):
+        return True
+    return False
+
+
+def _check_auth() -> bool:
+    if not HEXSTRIKE_API_KEY:
+        return True
+
+    auth = request.headers.get("Authorization", "")
+    api_key = request.headers.get("X-API-Key", "")
+
+    # For SSE/EventSource, allow token in query string (EventSource can't set headers)
+    token = request.args.get("token", "").strip()
+    if token and token == HEXSTRIKE_API_KEY:
+        return True
+
+    if api_key and api_key == HEXSTRIKE_API_KEY:
+        return True
+
+    if auth.startswith("Bearer ") and auth[len("Bearer "):].strip() == HEXSTRIKE_API_KEY:
+        return True
+
+    return False
+
+
+@app.before_request
+def _enforce_api_auth():
+    # Only enforce auth when API key is configured
+    if not HEXSTRIKE_API_KEY:
+        return None
+
+    if _is_auth_exempt_path(request.path):
+        return None
+
+    # Protect all API endpoints (and SSE endpoints under /api)
+    if request.path.startswith("/api/"):
+        if not _check_auth():
+            return jsonify({
+                "success": False,
+                "error": "Unauthorized",
+                "hint": "Provide Authorization: Bearer <HEXSTRIKE_API_KEY> or X-API-Key header"
+            }), 401
+
+    return None
 
 # API Configuration
 API_PORT = int(os.environ.get('HEXSTRIKE_PORT', 8888))
@@ -8933,10 +9012,26 @@ class FileOperationsManager:
         self.base_dir.mkdir(exist_ok=True)
         self.max_file_size = 100 * 1024 * 1024  # 100MB
 
+    def _safe_path(self, filename: str) -> Path:
+        """Resolve a filename safely inside base_dir (prevents path traversal)."""
+        if not filename or "\x00" in filename:
+            raise ValueError("Invalid filename")
+
+        base = self.base_dir.resolve()
+        candidate = (self.base_dir / filename).resolve()
+
+        # Ensure the resolved path stays within base dir
+        base_str = str(base)
+        cand_str = str(candidate)
+        if cand_str == base_str or cand_str.startswith(base_str + os.sep):
+            return candidate
+
+        raise ValueError("Unsafe path: outside base directory")
+
     def create_file(self, filename: str, content: str, binary: bool = False) -> Dict[str, Any]:
         """Create a file with the specified content"""
         try:
-            file_path = self.base_dir / filename
+            file_path = self._safe_path(filename)
             file_path.parent.mkdir(parents=True, exist_ok=True)
 
             if len(content.encode()) > self.max_file_size:
@@ -8959,7 +9054,7 @@ class FileOperationsManager:
     def modify_file(self, filename: str, content: str, append: bool = False) -> Dict[str, Any]:
         """Modify an existing file"""
         try:
-            file_path = self.base_dir / filename
+            file_path = self._safe_path(filename)
             if not file_path.exists():
                 return {"success": False, "error": "File does not exist"}
 
@@ -8977,7 +9072,7 @@ class FileOperationsManager:
     def delete_file(self, filename: str) -> Dict[str, Any]:
         """Delete a file or directory"""
         try:
-            file_path = self.base_dir / filename
+            file_path = self._safe_path(filename)
             if not file_path.exists():
                 return {"success": False, "error": "File does not exist"}
 
@@ -8996,7 +9091,7 @@ class FileOperationsManager:
     def list_files(self, directory: str = ".") -> Dict[str, Any]:
         """List files in a directory"""
         try:
-            dir_path = self.base_dir / directory
+            dir_path = self._safe_path(directory)
             if not dir_path.exists():
                 return {"success": False, "error": "Directory does not exist"}
 
@@ -9019,6 +9114,21 @@ class FileOperationsManager:
 file_manager = FileOperationsManager()
 
 # API Routes
+
+@app.route("/", methods=["GET"])
+def root():
+    return redirect(url_for("dashboard"))
+
+
+@app.route("/dashboard", methods=["GET"])
+def dashboard():
+    return render_template(
+        "dashboard.html",
+        api_host=API_HOST,
+        api_port=API_PORT,
+        version=HEXSTRIKE_VERSION,
+        api_key_required=bool(HEXSTRIKE_API_KEY),
+    )
 
 @app.route("/health", methods=["GET"])
 def health_check():
@@ -9123,7 +9233,12 @@ def health_check():
     return jsonify({
         "status": "healthy",
         "message": "HexStrike AI Tools API Server is operational",
-        "version": "6.0.0",
+        "version": HEXSTRIKE_VERSION,
+        "security": {
+            "api_key_required": bool(HEXSTRIKE_API_KEY),
+            "command_executor_enabled": HEXSTRIKE_ENABLE_COMMAND_EXECUTOR,
+            "exploit_features_enabled": HEXSTRIKE_ENABLE_EXPLOIT_FEATURES,
+        },
         "tools_status": tools_status,
         "all_essential_tools_available": all_essential_tools_available,
         "total_tools_available": sum(1 for tool, available in tools_status.items() if available),
@@ -9134,10 +9249,118 @@ def health_check():
         "uptime": time.time() - telemetry.stats["start_time"]
     })
 
+
+@app.route("/api/tools/status", methods=["GET"])
+def tools_status():
+    """Return installed status + version (best-effort) for allowlisted tools."""
+
+    allowlist = [
+        # Essential
+        "nmap", "gobuster", "dirb", "nikto", "sqlmap", "hydra", "john", "hashcat",
+        # Web
+        "nuclei", "ffuf", "feroxbuster", "dirsearch", "httpx", "katana", "wafw00f", "wpscan",
+        # Recon/OSINT
+        "amass", "subfinder", "gau", "waybackurls", "arjun", "paramspider", "dalfox",
+        # Cloud/K8s
+        "prowler", "trivy", "kube-hunter", "kube-bench", "checkov", "terrascan",
+        # Binary/forensics (common)
+        "gdb", "radare2", "binwalk", "checksec", "strings", "objdump", "volatility3",
+    ]
+
+    requested = request.args.get("tools", "").strip()
+    tools = allowlist
+    if requested:
+        req_tools = [t.strip() for t in requested.split(",") if t.strip()]
+        safe = []
+        for t in req_tools:
+            if re.fullmatch(r"[A-Za-z0-9._+\-]{1,64}", t) and t in allowlist:
+                safe.append(t)
+        if safe:
+            tools = safe
+
+    results = []
+    for tool in tools:
+        installed = bool(shutil.which(tool))
+        version = ""
+        if installed:
+            # Try common version flags
+            for cmd in (f"{tool} --version", f"{tool} -V", f"{tool} -v"):
+                out = execute_command(cmd, use_cache=True)
+                text = (out.get("stdout") or out.get("stderr") or "").strip()
+                if text:
+                    version = text.splitlines()[0][:200]
+                    break
+        results.append({
+            "tool": tool,
+            "installed": installed,
+            "version": version,
+        })
+
+    return jsonify({
+        "success": True,
+        "version": HEXSTRIKE_VERSION,
+        "tools": results,
+        "count": len(results),
+    })
+
+
+@app.route("/api/tools/install-plan", methods=["GET"])
+def tools_install_plan():
+    """Return a best-effort install/upgrade plan for common external tools.
+
+    Note: This endpoint does NOT execute installs. It only returns commands.
+    """
+
+    plan = {
+        "success": True,
+        "version": HEXSTRIKE_VERSION,
+        "note": "Commands are best-effort for Ubuntu/Debian-like systems. Versions depend on your repos and GOPATH; review before running.",
+        "apt": {
+            "update": "sudo apt-get update",
+            "install": "sudo apt-get install -y curl wget git build-essential jq python3-pip python3-venv nmap",
+        },
+        "go": {
+            "note": "Requires Go toolchain installed (go>=1.22 recommended).",
+            "install_go": "sudo apt-get install -y golang",
+            "install_tools": [
+                "go install -v github.com/projectdiscovery/httpx/cmd/httpx@latest",
+                "go install -v github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest",
+                "go install -v github.com/projectdiscovery/katana/cmd/katana@latest",
+                "go install -v github.com/ffuf/ffuf/v2@latest",
+                "go install -v github.com/lc/gau/v2/cmd/gau@latest",
+                "go install -v github.com/tomnomnom/waybackurls@latest",
+                "go install -v github.com/tomnomnom/anew@latest",
+            ],
+            "post_install": "echo 'Ensure $HOME/go/bin is in PATH (e.g., export PATH=$PATH:$HOME/go/bin)'",
+        },
+        "pip": {
+            "note": "Some tools are pip-installable; prefer official install instructions for your environment.",
+            "install": [
+                "python3 -m pip install --upgrade pip",
+                "python3 -m pip install --upgrade dirsearch paramspider",
+            ]
+        },
+        "manual": {
+            "notes": [
+                "gobuster, feroxbuster, dalfox, wpscan often require distro packages or project-specific install steps.",
+                "For cloud tools (prowler/scout-suite) follow upstream docs and configure credentials safely.",
+            ]
+        }
+    }
+
+    return jsonify(plan)
+
 @app.route("/api/command", methods=["POST"])
 def generic_command():
     """Execute any command provided in the request with enhanced logging"""
     try:
+        if not HEXSTRIKE_ENABLE_COMMAND_EXECUTOR:
+            return jsonify({
+                "success": False,
+                "error": "Command executor is disabled in v7.0 by default",
+                "hint": "Set HEXSTRIKE_ENABLE_COMMAND_EXECUTOR=true to enable /api/command"
+            }), 403
+
         params = request.json
         command = params.get("command", "")
         use_cache = params.get("use_cache", True)
@@ -9283,6 +9506,793 @@ def clear_cache():
 def get_telemetry():
     """Get system telemetry"""
     return jsonify(telemetry.get_stats())
+
+# ==========================================================================
+# RUN MANAGER (v7.0): LONG-RUNNING ASSESSMENTS + LIVE EVENTS (SSE)
+# ==========================================================================
+
+class RunManager:
+    """Track long-running runs (recon/assessment) with progress and SSE events."""
+
+    def __init__(self, max_events_per_run: int = 5000):
+        self._lock = threading.RLock()
+        self._runs: Dict[str, Dict[str, Any]] = {}
+        self._max_events = max_events_per_run
+
+    def create_run(self, run_type: str, params: Dict[str, Any]) -> Dict[str, Any]:
+        run_id = uuid.uuid4().hex
+        now = datetime.now().isoformat()
+        run = {
+            "run_id": run_id,
+            "run_type": run_type,
+            "params": params,
+            "status": "queued",
+            "progress": 0.0,
+            "created_at": now,
+            "updated_at": now,
+            "stages": [],
+            "results": {},
+            "logs": [],
+            "findings": [],
+            "_events": [],  # internal: list of {id, event}
+            "_next_event_id": 1,
+            "_cancelled": False,
+        }
+
+        with self._lock:
+            self._runs[run_id] = run
+
+        self.emit(run_id, "run.created", {"run_type": run_type, "params": params})
+        return self.get_run(run_id)
+
+    def list_runs(self, limit: int = 50) -> List[Dict[str, Any]]:
+        with self._lock:
+            runs = list(self._runs.values())
+
+        runs.sort(key=lambda r: r.get("created_at", ""), reverse=True)
+        return [self._public_view(r) for r in runs[:limit]]
+
+    def get_run(self, run_id: str) -> Dict[str, Any]:
+        with self._lock:
+            run = self._runs.get(run_id)
+            if not run:
+                return {}
+            return self._public_view(run)
+
+    def cancel_run(self, run_id: str) -> bool:
+        with self._lock:
+            run = self._runs.get(run_id)
+            if not run:
+                return False
+            run["_cancelled"] = True
+            run["status"] = "cancelled"
+            run["updated_at"] = datetime.now().isoformat()
+        self.emit(run_id, "run.cancelled", {})
+        return True
+
+    def is_cancelled(self, run_id: str) -> bool:
+        with self._lock:
+            run = self._runs.get(run_id)
+            return bool(run and run.get("_cancelled"))
+
+    def set_status(self, run_id: str, status: str, progress: float = None):
+        with self._lock:
+            run = self._runs.get(run_id)
+            if not run:
+                return
+            run["status"] = status
+            if progress is not None:
+                run["progress"] = max(0.0, min(1.0, float(progress)))
+            run["updated_at"] = datetime.now().isoformat()
+        self.emit(run_id, "run.status", {"status": status, "progress": self.get_run(run_id).get("progress", 0.0)})
+
+    def add_stage(self, run_id: str, name: str):
+        with self._lock:
+            run = self._runs.get(run_id)
+            if not run:
+                return
+            stage = {
+                "name": name,
+                "status": "queued",
+                "progress": 0.0,
+                "started_at": None,
+                "ended_at": None,
+            }
+            run["stages"].append(stage)
+            run["updated_at"] = datetime.now().isoformat()
+        self.emit(run_id, "stage.added", {"name": name})
+
+    def update_stage(self, run_id: str, name: str, status: str = None, progress: float = None):
+        with self._lock:
+            run = self._runs.get(run_id)
+            if not run:
+                return
+            for stage in run["stages"]:
+                if stage.get("name") == name:
+                    if status:
+                        stage["status"] = status
+                        if status == "running" and not stage.get("started_at"):
+                            stage["started_at"] = datetime.now().isoformat()
+                        if status in ("completed", "failed", "cancelled"):
+                            stage["ended_at"] = datetime.now().isoformat()
+                    if progress is not None:
+                        stage["progress"] = max(0.0, min(1.0, float(progress)))
+                    run["updated_at"] = datetime.now().isoformat()
+                    break
+        payload = {"name": name}
+        if status is not None:
+            payload["status"] = status
+        if progress is not None:
+            payload["progress"] = progress
+        self.emit(run_id, "stage.updated", payload)
+
+    def log(self, run_id: str, message: str, level: str = "info"):
+        entry = {
+            "ts": datetime.now().isoformat(),
+            "level": level,
+            "message": message,
+        }
+        with self._lock:
+            run = self._runs.get(run_id)
+            if not run:
+                return
+            run["logs"].append(entry)
+            if len(run["logs"]) > 2000:
+                run["logs"] = run["logs"][-2000:]
+            run["updated_at"] = datetime.now().isoformat()
+        self.emit(run_id, "log", entry)
+
+    def set_result(self, run_id: str, key: str, value: Any):
+        with self._lock:
+            run = self._runs.get(run_id)
+            if not run:
+                return
+            run["results"][key] = value
+            run["updated_at"] = datetime.now().isoformat()
+        self.emit(run_id, "result", {"key": key})
+
+    def add_findings(self, run_id: str, findings: List[Dict[str, Any]]):
+        if not findings:
+            return
+
+        with self._lock:
+            run = self._runs.get(run_id)
+            if not run:
+                return
+            run["findings"].extend(findings)
+            # cap to prevent unbounded growth
+            if len(run["findings"]) > 20000:
+                run["findings"] = run["findings"][-20000:]
+            run["updated_at"] = datetime.now().isoformat()
+
+        self.emit(run_id, "finding", {"count": len(findings)})
+
+    def get_findings(self, run_id: str, offset: int = 0, limit: int = 200) -> Dict[str, Any]:
+        with self._lock:
+            run = self._runs.get(run_id)
+            if not run:
+                return {"total": 0, "items": []}
+            items = run.get("findings", [])
+            total = len(items)
+            offset = max(0, int(offset))
+            limit = max(1, min(int(limit), 2000))
+            return {"total": total, "items": items[offset: offset + limit]}
+
+    def emit(self, run_id: str, event_type: str, data: Dict[str, Any]):
+        with self._lock:
+            run = self._runs.get(run_id)
+            if not run:
+                return
+            event_id = run.get("_next_event_id", 1)
+            run["_next_event_id"] = event_id + 1
+
+            event = {
+                "id": event_id,
+                "type": event_type,
+                "data": data,
+                "ts": datetime.now().isoformat(),
+            }
+            run["_events"].append(event)
+            if len(run["_events"]) > self._max_events:
+                run["_events"] = run["_events"][-self._max_events:]
+
+    def get_events_since(self, run_id: str, since_id: int) -> List[Dict[str, Any]]:
+        with self._lock:
+            run = self._runs.get(run_id)
+            if not run:
+                return []
+            return [e for e in run.get("_events", []) if int(e.get("id", 0)) > int(since_id)]
+
+    def _public_view(self, run: Dict[str, Any]) -> Dict[str, Any]:
+        # Do not leak internal fields
+        return {
+            "run_id": run.get("run_id"),
+            "run_type": run.get("run_type"),
+            "params": run.get("params", {}),
+            "status": run.get("status"),
+            "progress": run.get("progress", 0.0),
+            "created_at": run.get("created_at"),
+            "updated_at": run.get("updated_at"),
+            "stages": run.get("stages", []),
+            "results": run.get("results", {}),
+            "logs": run.get("logs", [])[-300:],
+            "findings": run.get("findings", [])[-200:],
+            "findings_total": len(run.get("findings", [])),
+            "last_event_id": (run.get("_next_event_id", 1) - 1),
+        }
+
+
+run_manager = RunManager()
+
+
+class ToolOutputNormalizer:
+    """Best-effort parsing of tool outputs into structured findings."""
+
+    SEVERITY_ORDER = {"critical": 4, "high": 3, "medium": 2, "low": 1, "info": 0}
+
+    @staticmethod
+    def _now() -> str:
+        return datetime.now().isoformat()
+
+    @staticmethod
+    def _mk_finding(tool: str, severity: str, title: str, target: str = "", location: str = "", evidence: str = "", finding_type: str = "finding") -> Dict[str, Any]:
+        sev = (severity or "info").strip().lower()
+        if sev not in ToolOutputNormalizer.SEVERITY_ORDER:
+            sev = "info"
+        return {
+            "id": uuid.uuid4().hex,
+            "ts": ToolOutputNormalizer._now(),
+            "tool": tool,
+            "severity": sev,
+            "type": finding_type,
+            "title": title[:200],
+            "target": target,
+            "location": location[:500],
+            "evidence": evidence[:2000],
+        }
+
+    @staticmethod
+    def normalize(tool: str, stdout: str, stderr: str = "", target: str = "") -> List[Dict[str, Any]]:
+        tool = (tool or "").strip().lower()
+        stdout = stdout or ""
+        stderr = stderr or ""
+
+        # Surface missing tool errors as findings
+        missing_patterns = (
+            "command not found",
+            "not found",
+            "no such file or directory",
+            "is not recognized as an internal or external command",
+        )
+        err_l = stderr.lower()
+        if (not stdout.strip()) and any(p in err_l for p in missing_patterns):
+            return [ToolOutputNormalizer._mk_finding(
+                tool or "tool",
+                "medium",
+                f"Tool missing or not installed: {tool or 'unknown'}",
+                target=target,
+                location="local environment",
+                evidence=(stderr or "").strip(),
+                finding_type="tool_missing",
+            )]
+
+        if tool == "nuclei":
+            return ToolOutputNormalizer._parse_nuclei(stdout, target)
+        if tool == "httpx":
+            return ToolOutputNormalizer._parse_httpx(stdout, target)
+        if tool == "katana":
+            return ToolOutputNormalizer._parse_katana(stdout, target)
+        if tool == "dirsearch":
+            return ToolOutputNormalizer._parse_dirsearch(stdout, target)
+        if tool == "feroxbuster":
+            return ToolOutputNormalizer._parse_feroxbuster(stdout, target)
+        if tool == "ffuf":
+            return ToolOutputNormalizer._parse_ffuf(stdout, target)
+
+        # Generic heuristic: treat discovered URLs/paths as info
+        return ToolOutputNormalizer._parse_generic_urls(tool, stdout, target)
+
+    @staticmethod
+    def _parse_nuclei(text: str, target: str) -> List[Dict[str, Any]]:
+        findings: List[Dict[str, Any]] = []
+        for line in text.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+
+            # JSONL output
+            if line.startswith("{") and line.endswith("}"):
+                try:
+                    obj = json.loads(line)
+                    info = obj.get("info", {}) or {}
+                    severity = (info.get("severity") or "info").lower()
+                    name = info.get("name") or obj.get("template") or obj.get("template-id") or "Nuclei finding"
+                    matched = obj.get("matched-at") or obj.get("host") or obj.get("url") or ""
+                    template_id = obj.get("template-id") or obj.get("template") or ""
+                    evidence = obj.get("matcher-name") or obj.get("extracted-results") or ""
+                    title = f"{name}"
+                    if template_id:
+                        title = f"{name} ({template_id})"
+                    findings.append(ToolOutputNormalizer._mk_finding("nuclei", severity, title, target=target, location=matched, evidence=str(evidence)))
+                    continue
+                except Exception:
+                    pass
+
+            # Text output heuristic, common format: [id] [severity] url
+            m = re.search(r"\[(?P<id>[^\]]+)\]\s*\[(?P<sev>critical|high|medium|low|info)\]\s*(?P<rest>.+)$", line, re.IGNORECASE)
+            if m:
+                sev = m.group("sev").lower()
+                template_id = m.group("id")
+                rest = m.group("rest").strip()
+                findings.append(ToolOutputNormalizer._mk_finding("nuclei", sev, f"Nuclei match ({template_id})", target=target, location=rest, evidence=line))
+
+        return findings
+
+    @staticmethod
+    def _parse_httpx(text: str, target: str) -> List[Dict[str, Any]]:
+        findings: List[Dict[str, Any]] = []
+        for line in text.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            # Common: https://host [200] [title]
+            m = re.match(r"^(?P<url>https?://\S+)(?:\s+\[(?P<code>\d{3})\])?(?:\s+\[(?P<title>[^\]]+)\])?.*$", line)
+            if m:
+                url = m.group("url")
+                code = m.group("code") or ""
+                title = m.group("title") or ""
+                t = "Live host"
+                if code:
+                    t += f" ({code})"
+                if title:
+                    t += f": {title}"
+                findings.append(ToolOutputNormalizer._mk_finding("httpx", "info", t, target=target, location=url, evidence=line, finding_type="asset"))
+        return findings
+
+    @staticmethod
+    def _parse_katana(text: str, target: str) -> List[Dict[str, Any]]:
+        findings: List[Dict[str, Any]] = []
+        for line in text.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            # JSONL entries contain url
+            if line.startswith("{") and line.endswith("}"):
+                try:
+                    obj = json.loads(line)
+                    url = obj.get("url") or obj.get("endpoint") or obj.get("request", {}).get("url") or ""
+                    if url:
+                        findings.append(ToolOutputNormalizer._mk_finding("katana", "info", "Discovered endpoint", target=target, location=url, evidence=line, finding_type="endpoint"))
+                    continue
+                except Exception:
+                    pass
+
+            # Fallback: plain lines with URLs
+            if line.startswith("http://") or line.startswith("https://"):
+                findings.append(ToolOutputNormalizer._mk_finding("katana", "info", "Discovered endpoint", target=target, location=line, evidence=line, finding_type="endpoint"))
+        return findings
+
+    @staticmethod
+    def _parse_dirsearch(text: str, target: str) -> List[Dict[str, Any]]:
+        findings: List[Dict[str, Any]] = []
+        for line in text.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            # Common: 200 - 123B - /admin
+            m = re.match(r"^(?P<code>\d{3})\s+[-|]\s+(?P<rest>.+)$", line)
+            if m:
+                code = m.group("code")
+                rest = m.group("rest")
+                sev = "info"
+                if code in ("401", "403"):
+                    sev = "low"
+                elif code.startswith("5"):
+                    sev = "medium"
+                findings.append(ToolOutputNormalizer._mk_finding("dirsearch", sev, f"Discovered path ({code})", target=target, location=rest, evidence=line, finding_type="endpoint"))
+        return findings
+
+    @staticmethod
+    def _parse_feroxbuster(text: str, target: str) -> List[Dict[str, Any]]:
+        findings: List[Dict[str, Any]] = []
+        for line in text.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            # Typical: 200      GET        12l       34w      123c http://host/path
+            m = re.match(r"^(?P<code>\d{3})\s+\w+\s+.*\s+(?P<url>https?://\S+)$", line)
+            if m:
+                code = m.group("code")
+                url = m.group("url")
+                sev = "info" if code == "200" else "low"
+                findings.append(ToolOutputNormalizer._mk_finding("feroxbuster", sev, f"Discovered endpoint ({code})", target=target, location=url, evidence=line, finding_type="endpoint"))
+        return findings
+
+    @staticmethod
+    def _parse_ffuf(text: str, target: str) -> List[Dict[str, Any]]:
+        findings: List[Dict[str, Any]] = []
+        for line in text.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            # JSON output if user enabled it
+            if line.startswith("{") and line.endswith("}"):
+                try:
+                    obj = json.loads(line)
+                    url = obj.get("url") or ""
+                    status = obj.get("status")
+                    if url:
+                        title = "FFUF match"
+                        if status:
+                            title += f" ({status})"
+                        findings.append(ToolOutputNormalizer._mk_finding("ffuf", "info", title, target=target, location=url, evidence=line, finding_type="endpoint"))
+                    continue
+                except Exception:
+                    pass
+
+            # Text output: often contains "|" separators and status/size
+            if "http" in line and any(code in line for code in ("200", "301", "302", "401", "403")):
+                url_m = re.search(r"(https?://\S+)", line)
+                if url_m:
+                    findings.append(ToolOutputNormalizer._mk_finding("ffuf", "info", "FFUF match", target=target, location=url_m.group(1), evidence=line, finding_type="endpoint"))
+        return findings
+
+    @staticmethod
+    def _parse_generic_urls(tool: str, text: str, target: str) -> List[Dict[str, Any]]:
+        findings: List[Dict[str, Any]] = []
+        url_re = re.compile(r"https?://[^\s'\"<>]+")
+        for line in text.splitlines():
+            for url in url_re.findall(line):
+                findings.append(ToolOutputNormalizer._mk_finding(tool or "tool", "info", "Discovered URL", target=target, location=url, evidence=line, finding_type="endpoint"))
+        return findings
+
+
+def _self_base_url() -> str:
+    return f"http://{API_HOST}:{API_PORT}"
+
+
+def _self_headers() -> Dict[str, str]:
+    headers = {"Content-Type": "application/json"}
+    if HEXSTRIKE_API_KEY:
+        headers["Authorization"] = f"Bearer {HEXSTRIKE_API_KEY}"
+    return headers
+
+
+def _run_worker(run_id: str, plan: List[Dict[str, Any]]):
+    import requests as _requests
+
+    run_manager.set_status(run_id, "running", progress=0.01)
+    total = max(1, len(plan))
+    had_errors = False
+
+    for idx, step in enumerate(plan, start=1):
+        if run_manager.is_cancelled(run_id):
+            run_manager.log(run_id, "Run cancelled by user", level="warning")
+            run_manager.set_status(run_id, "cancelled", progress=run_manager.get_run(run_id).get("progress", 0.0))
+            return
+
+        name = step.get("name", f"step-{idx}")
+        endpoint = step.get("endpoint")
+        payload = step.get("payload", {})
+        allow_fail = bool(step.get("allow_fail", False))
+
+        run_manager.add_stage(run_id, name)
+        run_manager.update_stage(run_id, name, status="running", progress=0.0)
+        run_manager.log(run_id, f"Calling {endpoint}")
+
+        try:
+            url = _self_base_url() + endpoint
+            resp = _requests.post(url, json=payload, headers=_self_headers(), timeout=HEXSTRIKE_RUN_HTTP_TIMEOUT)
+            data = resp.json() if resp.headers.get("content-type", "").startswith("application/json") else {"raw": resp.text}
+
+            ok = bool(data.get("success", True)) and resp.status_code < 400
+
+            run_manager.set_result(run_id, name, {
+                "http_status": resp.status_code,
+                "response": data,
+            })
+
+            # Extract findings (best-effort)
+            try:
+                extracted: List[Dict[str, Any]] = []
+                if endpoint == "/api/intelligence/smart-scan" and isinstance(data, dict):
+                    scan = data.get("scan_results", {}) if data.get("success") else data.get("scan_results", {})
+                    tools_executed = scan.get("tools_executed", []) if isinstance(scan, dict) else []
+                    for tr in tools_executed:
+                        tool_name = (tr.get("tool") or "").lower()
+                        stdout = tr.get("stdout", "")
+                        stderr = tr.get("stderr", "")
+                        extracted.extend(ToolOutputNormalizer.normalize(tool_name, stdout, stderr, target=payload.get("target", "")))
+                elif endpoint.startswith("/api/tools/") and isinstance(data, dict):
+                    tool_name = endpoint.split("/api/tools/", 1)[1].split("/", 1)[0]
+                    stdout = data.get("stdout", "")
+                    stderr = data.get("stderr", "")
+                    # For some tools the input key is url/domain/target; keep best-effort
+                    tgt = payload.get("url") or payload.get("domain") or payload.get("target") or ""
+                    extracted.extend(ToolOutputNormalizer.normalize(tool_name, stdout, stderr, target=tgt))
+
+                # De-dup by (tool, title, location)
+                if extracted:
+                    seen = set()
+                    deduped = []
+                    for f in extracted:
+                        key = (f.get("tool"), f.get("title"), f.get("location"))
+                        if key in seen:
+                            continue
+                        seen.add(key)
+                        deduped.append(f)
+                    run_manager.add_findings(run_id, deduped)
+            except Exception:
+                pass
+
+            if not ok:
+                run_manager.update_stage(run_id, name, status="failed", progress=1.0)
+                if allow_fail:
+                    had_errors = True
+                    run_manager.log(run_id, f"Step failed (allowed): {name}", level="warning")
+                else:
+                    run_manager.log(run_id, f"Step failed: {name}", level="error")
+                    run_manager.set_status(run_id, "failed", progress=min(0.99, idx / total))
+                    return
+
+            if ok:
+                run_manager.update_stage(run_id, name, status="completed", progress=1.0)
+
+        except Exception as e:
+            run_manager.update_stage(run_id, name, status="failed", progress=1.0)
+            if allow_fail:
+                had_errors = True
+                run_manager.log(run_id, f"Exception (allowed): {e}", level="warning")
+            else:
+                run_manager.log(run_id, f"Exception: {e}", level="error")
+                run_manager.set_status(run_id, "failed", progress=min(0.99, idx / total))
+                return
+
+        run_manager.set_status(run_id, "running", progress=min(0.99, idx / total))
+
+    if had_errors:
+        run_manager.set_status(run_id, "completed_with_errors", progress=1.0)
+        run_manager.log(run_id, "Run completed with errors", level="warning")
+    else:
+        run_manager.set_status(run_id, "completed", progress=1.0)
+        run_manager.log(run_id, "Run completed", level="info")
+
+
+@app.route("/api/runs", methods=["GET"])
+def list_runs_api():
+    limit = int(request.args.get("limit", 50))
+    return jsonify({"success": True, "runs": run_manager.list_runs(limit=limit)})
+
+
+@app.route("/api/runs/<run_id>", methods=["GET"])
+def get_run_api(run_id: str):
+    run = run_manager.get_run(run_id)
+    if not run:
+        return jsonify({"success": False, "error": "Run not found"}), 404
+    return jsonify({"success": True, "run": run})
+
+
+@app.route("/api/runs/<run_id>/cancel", methods=["POST"])
+def cancel_run_api(run_id: str):
+    if run_manager.cancel_run(run_id):
+        return jsonify({"success": True, "run_id": run_id, "status": "cancelled"})
+    return jsonify({"success": False, "error": "Run not found"}), 404
+
+
+@app.route("/api/runs/<run_id>/events", methods=["GET"])
+def run_events_sse(run_id: str):
+    # Server-Sent Events stream for dashboard
+    run = run_manager.get_run(run_id)
+    if not run:
+        return jsonify({"success": False, "error": "Run not found"}), 404
+
+    try:
+        since = int(request.args.get("since", 0))
+    except Exception:
+        since = 0
+
+    @stream_with_context
+    def generate():
+        last_id = since
+        # Send an initial hello event
+        yield f"event: hello\ndata: {json.dumps({'run_id': run_id, 'ts': datetime.now().isoformat()})}\n\n"
+
+        # Stream for up to ~5 minutes per connection (browser auto-reconnects)
+        start = time.time()
+        while time.time() - start < 300:
+            events = run_manager.get_events_since(run_id, last_id)
+            if events:
+                for ev in events:
+                    last_id = int(ev.get("id", last_id))
+                    yield f"id: {last_id}\n"
+                    yield f"event: {ev.get('type','message')}\n"
+                    yield f"data: {json.dumps(ev)}\n\n"
+            else:
+                yield ": keepalive\n\n"
+
+            time.sleep(1.0)
+
+    return Response(generate(), mimetype="text/event-stream")
+
+
+@app.route("/api/runs/<run_id>/findings", methods=["GET"])
+def run_findings_api(run_id: str):
+    run = run_manager.get_run(run_id)
+    if not run:
+        return jsonify({"success": False, "error": "Run not found"}), 404
+
+    try:
+        offset = int(request.args.get("offset", 0))
+    except Exception:
+        offset = 0
+    try:
+        limit = int(request.args.get("limit", 200))
+    except Exception:
+        limit = 200
+
+    data = run_manager.get_findings(run_id, offset=offset, limit=limit)
+    return jsonify({"success": True, "run_id": run_id, **data})
+
+
+@app.route("/api/runs/start", methods=["POST"])
+def start_run_api():
+    data = request.get_json() or {}
+    run_type = (data.get("run_type") or "smart_scan").strip()
+
+    # Normalize payload for known run types
+    plan: List[Dict[str, Any]] = []
+
+    if run_type == "smart_scan":
+        target = data.get("target")
+        if not target:
+            return jsonify({"success": False, "error": "target is required for smart_scan"}), 400
+        plan = [{
+            "name": "smart_scan",
+            "endpoint": "/api/intelligence/smart-scan",
+            "payload": {
+                "target": target,
+                "objective": data.get("objective", "comprehensive"),
+                "max_tools": int(data.get("max_tools", 5)),
+            }
+        }]
+
+    elif run_type == "bugbounty_assessment":
+        domain = data.get("domain")
+        if not domain:
+            return jsonify({"success": False, "error": "domain is required for bugbounty_assessment"}), 400
+        plan = [{
+            "name": "bugbounty_comprehensive_assessment",
+            "endpoint": "/api/bugbounty/comprehensive-assessment",
+            "payload": {
+                "domain": domain,
+                "scope": data.get("scope", []),
+                "priority_vulns": data.get("priority_vulns", ["rce", "sqli", "xss", "idor", "ssrf"]),
+                "include_osint": bool(data.get("include_osint", True)),
+                "include_business_logic": bool(data.get("include_business_logic", True)),
+            }
+        }]
+
+    elif run_type == "recon_workflow":
+        domain = data.get("domain")
+        if not domain:
+            return jsonify({"success": False, "error": "domain is required for recon_workflow"}), 400
+        plan = [{
+            "name": "reconnaissance_workflow",
+            "endpoint": "/api/bugbounty/reconnaissance-workflow",
+            "payload": {
+                "domain": domain,
+                "scope": data.get("scope", []),
+                "out_of_scope": data.get("out_of_scope", []),
+                "program_type": data.get("program_type", "web"),
+            }
+        }]
+
+    elif run_type == "osint_workflow":
+        domain = data.get("domain")
+        if not domain:
+            return jsonify({"success": False, "error": "domain is required for osint_workflow"}), 400
+        plan = [{
+            "name": "osint_workflow",
+            "endpoint": "/api/bugbounty/osint-workflow",
+            "payload": {"domain": domain}
+        }]
+
+    elif run_type == "business_logic_workflow":
+        domain = data.get("domain")
+        if not domain:
+            return jsonify({"success": False, "error": "domain is required for business_logic_workflow"}), 400
+        plan = [{
+            "name": "business_logic_workflow",
+            "endpoint": "/api/bugbounty/business-logic-workflow",
+            "payload": {"domain": domain, "program_type": data.get("program_type", "web")}
+        }]
+
+    elif run_type == "file_upload_workflow":
+        target_url = data.get("target_url")
+        if not target_url:
+            return jsonify({"success": False, "error": "target_url is required for file_upload_workflow"}), 400
+        plan = [{
+            "name": "file_upload_testing",
+            "endpoint": "/api/bugbounty/file-upload-testing",
+            "payload": {"target_url": target_url}
+        }]
+
+    elif run_type == "web_assessment":
+        target = data.get("target")
+        if not target:
+            return jsonify({"success": False, "error": "target is required for web_assessment"}), 400
+
+        # Multi-stage safe pipeline; tool steps can fail without aborting entire run.
+        plan = [
+            {
+                "name": "analyze_target",
+                "endpoint": "/api/intelligence/analyze-target",
+                "payload": {"target": target},
+                "allow_fail": True,
+            },
+            {
+                "name": "technology_detection",
+                "endpoint": "/api/intelligence/technology-detection",
+                "payload": {"target": target},
+                "allow_fail": True,
+            },
+            {
+                "name": "httpx_probe",
+                "endpoint": "/api/tools/httpx",
+                "payload": {
+                    "target": target,
+                    "probe": True,
+                    "tech_detect": True,
+                    "status_code": True,
+                    "title": True,
+                },
+                "allow_fail": True,
+            },
+            {
+                "name": "katana_crawl",
+                "endpoint": "/api/tools/katana",
+                "payload": {
+                    "url": target,
+                    "depth": int(data.get("depth", 2)),
+                    "js_crawl": True,
+                    "form_extraction": True,
+                    "output_format": "json",
+                },
+                "allow_fail": True,
+            },
+            {
+                "name": "nuclei_scan",
+                "endpoint": "/api/tools/nuclei",
+                "payload": {
+                    "target": target,
+                    "severity": data.get("severity", "critical,high,medium"),
+                    "additional_args": data.get("nuclei_args", "-jsonl"),
+                },
+                "allow_fail": True,
+            },
+        ]
+
+    else:
+        return jsonify({
+            "success": False,
+            "error": f"Unknown run_type: {run_type}",
+            "supported": [
+                "smart_scan",
+                "bugbounty_assessment",
+                "recon_workflow",
+                "osint_workflow",
+                "business_logic_workflow",
+                "file_upload_workflow",
+                "web_assessment",
+            ]
+        }), 400
+
+    run = run_manager.create_run(run_type, data)
+
+    worker = threading.Thread(target=_run_worker, args=(run["run_id"], plan), daemon=True)
+    worker.start()
+
+    return jsonify({"success": True, "run": run})
 
 # ============================================================================
 # PROCESS MANAGEMENT API ENDPOINTS (v5.0 ENHANCEMENT)
@@ -9863,13 +10873,17 @@ def execute_nuclei_scan(target, params):
         tags = params.get('tags', '')
         additional_args = params.get('additional_args', '')
 
+        # Prefer structured output for normalization
+        if "-jsonl" not in additional_args and "-json" not in additional_args:
+            additional_args = (additional_args + " -jsonl").strip()
+
         cmd_parts = ['nuclei', '-u', target]
         if severity:
             cmd_parts.extend(['-severity', severity])
         if tags:
             cmd_parts.extend(['-tags', tags])
         if additional_args:
-            cmd_parts.extend(additional_args.split())
+            cmd_parts.extend(shlex.split(additional_args))
 
         return execute_command(' '.join(cmd_parts))
     except Exception as e:
@@ -9935,9 +10949,13 @@ def execute_katana_scan(target, params):
     """Execute katana scan with optimized parameters"""
     try:
         additional_args = params.get('additional_args', '')
+
+        if "-jsonl" not in additional_args and "-json" not in additional_args:
+            additional_args = (additional_args + " -jsonl").strip()
+
         cmd_parts = ['katana', '-u', target]
         if additional_args:
-            cmd_parts.extend(additional_args.split())
+            cmd_parts.extend(shlex.split(additional_args))
 
         return execute_command(' '.join(cmd_parts))
     except Exception as e:
@@ -9947,10 +10965,13 @@ def execute_httpx_scan(target, params):
     """Execute httpx scan with optimized parameters"""
     try:
         additional_args = params.get('additional_args', '-tech-detect -status-code')
-        # Use shell command with pipe for httpx
-        cmd = f"echo {target} | httpx {additional_args}"
 
-        return execute_command(cmd)
+        # Prefer direct target input (no pipe)
+        cmd_parts = ['httpx', '-u', target]
+        if additional_args:
+            cmd_parts.extend(shlex.split(additional_args))
+
+        return execute_command(' '.join(cmd_parts))
     except Exception as e:
         return {"success": False, "error": str(e)}
 
@@ -13151,7 +14172,13 @@ def httpx():
             logger.warning("🌐 httpx called without target parameter")
             return jsonify({"error": "Target parameter is required"}), 400
 
-        command = f"httpx -l {target} -t {threads}"
+        # httpx supports either a list file (-l) or a single URL/host (-u)
+        # Prefer -l when the given target looks like an existing file path.
+        target_path = Path(str(target))
+        if target_path.exists() and target_path.is_file():
+            command = f"httpx -l {target} -t {threads}"
+        else:
+            command = f"httpx -u {target} -t {threads}"
 
         if probe:
             command += " -probe"
@@ -15551,6 +16578,13 @@ def cve_monitor():
 def exploit_generate():
     """Generate exploits from vulnerability data using AI"""
     try:
+        if not HEXSTRIKE_ENABLE_EXPLOIT_FEATURES:
+            return jsonify({
+                "success": False,
+                "error": "Exploit features are disabled in v7.0 by default",
+                "hint": "Set HEXSTRIKE_ENABLE_EXPLOIT_FEATURES=true to enable exploit generation endpoints"
+            }), 403
+
         params = request.json
         cve_id = params.get("cve_id", "")
         target_os = params.get("target_os", "")
@@ -15624,6 +16658,13 @@ def exploit_generate():
 def discover_attack_chains():
     """Discover multi-stage attack possibilities"""
     try:
+        if not HEXSTRIKE_ENABLE_EXPLOIT_FEATURES:
+            return jsonify({
+                "success": False,
+                "error": "Exploit features are disabled in v7.0 by default",
+                "hint": "Set HEXSTRIKE_ENABLE_EXPLOIT_FEATURES=true to enable attack-chain enrichment"
+            }), 403
+
         params = request.json
         target_software = params.get("target_software", "")
         attack_depth = params.get("attack_depth", 3)
